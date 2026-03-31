@@ -1,0 +1,1 @@
+# kure-oyunu-app
