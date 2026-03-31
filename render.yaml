@@ -2,11 +2,23 @@ services:
   - type: web
     name: cenan6238-kure-oyunu
     runtime: node
+    region: frankfurt
     rootDir: server
-    buildCommand: npm install
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
+    healthCheckPath: /health
     plan: free
     autoDeploy: true
     envVars:
       - key: NODE_VERSION
         value: 20
+      - key: NODE_ENV
+        value: production
+      - key: ROOM_OPEN_TTL_MS
+        value: 1200000
+      - key: ROOM_IDLE_TTL_MS
+        value: 2700000
+      - key: ROOM_CLEANUP_INTERVAL_MS
+        value: 60000
+      - key: MAX_ROOM_LIST_SIZE
+        value: 80

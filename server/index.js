@@ -8,16 +8,37 @@ const { applyMove, createInitialState } = require('./gameEngine');
 const PORT = Number(process.env.PORT || 4000);
 const ROOM_CODE_LENGTH = 5;
 const MAX_ROOMS = 500;
+const ROOM_OPEN_TTL_MS = Number(process.env.ROOM_OPEN_TTL_MS || 20 * 60 * 1000);
+const ROOM_IDLE_TTL_MS = Number(process.env.ROOM_IDLE_TTL_MS || 45 * 60 * 1000);
+const ROOM_CLEANUP_INTERVAL_MS = Number(process.env.ROOM_CLEANUP_INTERVAL_MS || 60 * 1000);
+const MAX_ROOM_LIST_SIZE = Number(process.env.MAX_ROOM_LIST_SIZE || 80);
 
 const app = express();
+app.disable('x-powered-by');
 app.use(cors());
 app.use(express.json());
+app.use((_, response, next) => {
+  response.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 app.get('/health', (_, response) => {
+  const memoryUsage = process.memoryUsage();
   response.json({
     ok: true,
+    uptimeSec: Math.floor(process.uptime()),
+    memoryRssMb: Math.round(memoryUsage.rss / (1024 * 1024)),
     rooms: rooms.size,
-    openRooms: listOpenRooms().length,
+    openRooms: countOpenRooms(),
+    timestamp: Date.now(),
+  });
+});
+
+app.get('/', (_, response) => {
+  response.json({
+    ok: true,
+    service: 'kure-online-server',
+    hint: 'Use /health for status and /rooms for open rooms.',
     timestamp: Date.now(),
   });
 });
@@ -31,14 +52,22 @@ app.get('/rooms', (_, response) => {
 });
 
 const httpServer = http.createServer(app);
+httpServer.keepAliveTimeout = 65 * 1000;
+httpServer.headersTimeout = 66 * 1000;
+
 const io = new Server(httpServer, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST'],
   },
+  pingInterval: 20000,
+  pingTimeout: 60000,
 });
 
 const rooms = new Map();
+
+const cleanupTimer = setInterval(cleanupRooms, ROOM_CLEANUP_INTERVAL_MS);
+cleanupTimer.unref();
 
 io.on('connection', (socket) => {
   socket.on('create_room', ({ nickname }) => {
@@ -77,6 +106,7 @@ io.on('connection', (socket) => {
       id: socket.id,
       nickname: sanitizeNickname(nickname),
     };
+    touchRoom(room);
 
     attachSocketToRoom(socket, code, 'indigo');
 
@@ -103,6 +133,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         nickname: sanitizeNickname(nickname),
       };
+      touchRoom(openRoom);
 
       attachSocketToRoom(socket, openRoom.roomCode, 'indigo');
 
@@ -171,6 +202,7 @@ io.on('connection', (socket) => {
     }
 
     room.state = result.state;
+    touchRoom(room);
 
     const message = room.state.winner
       ? `${getColorLabel(room.state.winner)} oyuncusu turu kazandi.`
@@ -201,6 +233,7 @@ io.on('connection', (socket) => {
     }
 
     room.state = createInitialState();
+    touchRoom(room);
 
     io.to(code).emit('room_update', {
       state: room.state,
@@ -253,6 +286,8 @@ function detachSocketFromRoom(socket, roomCode) {
     rooms.delete(roomCode);
     return;
   }
+
+  touchRoom(room);
 
   io.to(roomCode).emit('opponent_left', {
     message: 'Rakip odadan ayrildi.',
@@ -314,10 +349,12 @@ function generateRoomCode() {
 }
 
 function createRoom(socket, nickname) {
+  const now = Date.now();
   const roomCode = generateRoomCode();
   const room = {
     roomCode,
-    createdAt: Date.now(),
+    createdAt: now,
+    lastActivityAt: now,
     state: createInitialState(),
     players: {
       gold: {
@@ -344,9 +381,67 @@ function listOpenRooms() {
   return Array.from(rooms.values())
     .filter((room) => room.players.gold && !room.players.indigo)
     .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(0, MAX_ROOM_LIST_SIZE)
     .map((room) => ({
       roomCode: room.roomCode,
       host: room.players.gold.nickname,
       createdAt: room.createdAt,
     }));
 }
+
+function countOpenRooms() {
+  let count = 0;
+  for (const room of rooms.values()) {
+    if (room.players.gold && !room.players.indigo) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function touchRoom(room) {
+  room.lastActivityAt = Date.now();
+}
+
+function cleanupRooms() {
+  const now = Date.now();
+  let removedRooms = 0;
+
+  for (const [roomCode, room] of rooms.entries()) {
+    const hasBothPlayers = Boolean(room.players.gold && room.players.indigo);
+    const lastActivity = room.lastActivityAt || room.createdAt;
+    const ttl = hasBothPlayers ? ROOM_IDLE_TTL_MS : ROOM_OPEN_TTL_MS;
+
+    if (now - lastActivity > ttl) {
+      rooms.delete(roomCode);
+      removedRooms += 1;
+    }
+  }
+
+  if (removedRooms > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[cleanup] ${removedRooms} room(s) removed`);
+  }
+}
+
+let shuttingDown = false;
+function handleShutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  // eslint-disable-next-line no-console
+  console.log(`[shutdown] ${signal} received`);
+
+  io.close(() => {
+    httpServer.close(() => {
+      process.exit(0);
+    });
+  });
+
+  setTimeout(() => process.exit(0), 8000).unref();
+}
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));

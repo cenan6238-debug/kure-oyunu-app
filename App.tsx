@@ -183,7 +183,7 @@ function buildCaptureSegments(
 }
 
 export default function App() {
-  const { width } = useWindowDimensions();
+  const { width, height } = useWindowDimensions();
   const socketRef = useRef<Socket | null>(null);
   const [screen, setScreen] = useState<Screen>('home');
   const [rulesBackTarget, setRulesBackTarget] = useState<Screen>('home');
@@ -208,6 +208,7 @@ export default function App() {
   });
   const [socketConnected, setSocketConnected] = useState(false);
   const [isLoadingRooms, setIsLoadingRooms] = useState(false);
+  const [onlineBusy, setOnlineBusy] = useState(false);
   const [openRooms, setOpenRooms] = useState<OpenRoom[]>([]);
   const [matchReady, setMatchReady] = useState(false);
   const [paletteByPlayer, setPaletteByPlayer] = useState<Record<Player, PaletteId>>({
@@ -234,7 +235,13 @@ export default function App() {
   const captureSoundRef = useRef<Audio.Sound | null>(null);
   const winSoundRef = useRef<Audio.Sound | null>(null);
 
-  const boardSize = Math.min(width - 26, 430);
+  const isCompactLayout = height < 760;
+  const layoutGap = isCompactLayout ? 8 : 12;
+  const scoreCardHeight = isCompactLayout ? 110 : height < 860 ? 122 : 132;
+  const footerMinHeight = isCompactLayout ? 126 : 146;
+  const footerTextMinHeight = isCompactLayout ? 34 : 44;
+  const boardMaxByHeight = Math.max(250, height - (mode === 'online' ? 430 : 380));
+  const boardSize = Math.min(width - 26, 430, boardMaxByHeight);
   const cellSize = boardSize / BOARD_SIZE;
   const boardInset = 8;
   const playerTheme = useMemo(
@@ -449,6 +456,51 @@ export default function App() {
     refreshOpenRooms(false);
   }, [screen]);
 
+  function delay(ms: number) {
+    return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function fetchWithTimeout(url: string, timeoutMs: number) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(url, { signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function warmServer(showStatus = true): Promise<boolean> {
+    const healthUrl = `${DEFAULT_SERVER_URL}/health`;
+    const attempts = [25000, 18000, 12000];
+
+    for (let index = 0; index < attempts.length; index += 1) {
+      if (showStatus) {
+        setStatusText(
+          index === 0
+            ? 'Sunucu uyandırılıyor, lütfen bekle...'
+            : `Sunucu hazırlanıyor... (${index + 1}/${attempts.length})`,
+        );
+      }
+
+      try {
+        const response = await fetchWithTimeout(healthUrl, attempts[index]);
+        if (response.ok) {
+          return true;
+        }
+      } catch {
+        // Render free planda ilk denemelerde timeout normal.
+      }
+
+      if (index < attempts.length - 1) {
+        await delay(1400);
+      }
+    }
+
+    return false;
+  }
+
   function connectSocket(initialAction?: (socket: Socket) => void) {
     const url = DEFAULT_SERVER_URL;
 
@@ -458,10 +510,11 @@ export default function App() {
 
     const socket = io(url, {
       transports: ['websocket', 'polling'],
-      timeout: 12000,
+      timeout: 24000,
       reconnection: true,
-      reconnectionAttempts: 8,
-      reconnectionDelay: 900,
+      reconnectionAttempts: 12,
+      reconnectionDelay: 1100,
+      reconnectionDelayMax: 3500,
     });
 
     socketRef.current = socket;
@@ -472,6 +525,7 @@ export default function App() {
 
     socket.on('connect', () => {
       setSocketConnected(true);
+      setOnlineBusy(false);
       if (!actionFired && initialAction) {
         actionFired = true;
         initialAction(socket);
@@ -486,18 +540,27 @@ export default function App() {
     });
 
     socket.on('connect_error', (error) => {
-      setStatusText(`Bağlantı hatası: ${error.message}`);
+      setOnlineBusy(false);
+      const lower = error.message.toLowerCase();
+      if (lower.includes('timeout') || lower.includes('network')) {
+        setStatusText('Sunucuya erişilemiyor. Render uyanıyor olabilir, tekrar dene.');
+      } else {
+        setStatusText(`Bağlantı hatası: ${error.message}`);
+      }
     });
 
     socket.on('room_error', (payload: { message?: string }) => {
+      setOnlineBusy(false);
       setStatusText(payload.message || 'Bir oda hatası oluştu.');
     });
 
     socket.on('room_created', (payload: OnlinePayload) => {
+      setOnlineBusy(false);
       enterOnlineMatch(payload, 'Oda oluşturuldu.');
     });
 
     socket.on('room_joined', (payload: OnlinePayload) => {
+      setOnlineBusy(false);
       enterOnlineMatch(payload, 'Odaya bağlandın.');
     });
 
@@ -542,9 +605,17 @@ export default function App() {
     const url = DEFAULT_SERVER_URL;
 
     setIsLoadingRooms(true);
+    setOnlineBusy(true);
 
     try {
-      const response = await fetch(`${url}/rooms`);
+      const warmed = await warmServer(showStatus);
+      if (!warmed) {
+        setStatusText('Sunucu henüz uyanmadı. 20-40 sn sonra tekrar dene.');
+        setOpenRooms([]);
+        return;
+      }
+
+      const response = await fetchWithTimeout(`${url}/rooms`, 12000);
       if (!response.ok) {
         setStatusText(`Açık oda listesi alınamadı: ${response.status}`);
         return;
@@ -566,10 +637,11 @@ export default function App() {
       setStatusText(`Açık odalar alınamadı: ${message}`);
     } finally {
       setIsLoadingRooms(false);
+      setOnlineBusy(false);
     }
   }
 
-  function joinByCode(roomCodeValue: string) {
+  async function joinByCode(roomCodeValue: string) {
     const name = nickname.trim();
     const code = roomCodeValue.trim().toUpperCase();
 
@@ -583,15 +655,31 @@ export default function App() {
       return;
     }
 
+    setOnlineBusy(true);
+    const warmed = await warmServer(true);
+    if (!warmed) {
+      setOnlineBusy(false);
+      setStatusText('Sunucu henüz uyanmadı. Birkaç saniye sonra tekrar dene.');
+      return;
+    }
+
     connectSocket((socket) => {
       socket.emit('join_room', { nickname: name, roomCode: code });
     });
   }
 
-  function quickMatch() {
+  async function quickMatch() {
     const name = nickname.trim();
     if (!name) {
       setStatusText('Lütfen oyuncu adı gir.');
+      return;
+    }
+
+    setOnlineBusy(true);
+    const warmed = await warmServer(true);
+    if (!warmed) {
+      setOnlineBusy(false);
+      setStatusText('Sunucu henüz uyanmadı. Birkaç saniye sonra tekrar dene.');
       return;
     }
 
@@ -670,10 +758,18 @@ export default function App() {
     setStatusText(`Yapay zekâya karşı yeni maç başladı. Zorluk: ${cpuDifficulty}/10.`);
   }
 
-  function createRoom() {
+  async function createRoom() {
     const name = nickname.trim();
     if (!name) {
       setStatusText('Lütfen oyuncu adı gir.');
+      return;
+    }
+
+    setOnlineBusy(true);
+    const warmed = await warmServer(true);
+    if (!warmed) {
+      setOnlineBusy(false);
+      setStatusText('Sunucu henüz uyanmadı. Birkaç saniye sonra tekrar dene.');
       return;
     }
 
@@ -900,13 +996,21 @@ export default function App() {
           </View>
 
           <View style={styles.onlineButtons}>
-            <Pressable onPress={createRoom} style={styles.primaryButton}>
-              <Text style={styles.primaryButtonText}>Oda Oluştur</Text>
+            <Pressable
+              onPress={createRoom}
+              style={[styles.primaryButton, onlineBusy && styles.disabledButton]}
+              disabled={onlineBusy}
+            >
+              <Text style={styles.primaryButtonText}>{onlineBusy ? 'Hazırlanıyor...' : 'Oda Oluştur'}</Text>
             </Pressable>
           </View>
 
-          <Pressable onPress={quickMatch} style={styles.quickMatchButton}>
-            <Text style={styles.quickMatchButtonText}>Hızlı Eşleş</Text>
+          <Pressable
+            onPress={quickMatch}
+            style={[styles.quickMatchButton, onlineBusy && styles.disabledButton]}
+            disabled={onlineBusy}
+          >
+            <Text style={styles.quickMatchButtonText}>{onlineBusy ? 'Bekle...' : 'Hızlı Eşleş'}</Text>
           </Pressable>
 
           <View style={styles.roomListCard}>
@@ -915,10 +1019,10 @@ export default function App() {
               <Pressable
                 onPress={() => refreshOpenRooms(true)}
                 style={styles.roomListRefreshButton}
-                disabled={isLoadingRooms}
+                disabled={isLoadingRooms || onlineBusy}
               >
                 <Text style={styles.roomListRefreshButtonText}>
-                  {isLoadingRooms ? 'Yenileniyor...' : 'Yenile'}
+                  {isLoadingRooms || onlineBusy ? 'Yenileniyor...' : 'Yenile'}
                 </Text>
               </Pressable>
             </View>
@@ -935,13 +1039,22 @@ export default function App() {
                   </View>
                   <Pressable
                     onPress={() => joinByCode(room.roomCode)}
-                    style={styles.roomJoinButton}
+                    style={[styles.roomJoinButton, onlineBusy && styles.disabledButton]}
+                    disabled={onlineBusy}
                   >
                     <Text style={styles.roomJoinButtonText}>Katıl</Text>
                   </Pressable>
                 </View>
               ))
             )}
+          </View>
+
+          <View style={styles.statusCard}>
+            <Text style={styles.statusTitle}>Durum</Text>
+            <Text style={styles.statusText}>{statusText}</Text>
+            <Text style={styles.statusHint}>
+              Free sunucuda ilk bağlantı biraz sürebilir. Oda aç/katıl düğmesi otomatik olarak sunucuyu uyandırır.
+            </Text>
           </View>
 
           <Pressable onPress={() => setScreen('home')} style={styles.backButton}>
@@ -1013,7 +1126,15 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="light" />
-      <View style={styles.gameLayout}>
+      <View
+        style={[
+          styles.gameLayout,
+          {
+            gap: layoutGap,
+            paddingBottom: isCompactLayout ? 10 : 16,
+          },
+        ]}
+      >
         <View style={styles.gameTopBar}>
           <Pressable onPress={mode === 'online' ? leaveOnlineMatch : () => setScreen('home')} style={styles.iconButton}>
             <Text style={styles.iconButtonText}>{mode === 'online' ? 'Odadan Çık' : 'Ana Menü'}</Text>
@@ -1038,7 +1159,7 @@ export default function App() {
           </View>
         ) : null}
 
-        <View style={styles.scoreRow}>
+        <View style={[styles.scoreRow, { minHeight: scoreCardHeight }]}>
           <ScoreCard
             player="gold"
             state={state}
@@ -1048,8 +1169,9 @@ export default function App() {
             capturedStoneColor={playerTheme.indigo.piece}
             capturedStoneAccent={playerTheme.indigo.accent}
             trayPulse={trayPulse.gold}
+            cardHeight={scoreCardHeight}
           />
-          <View style={styles.turnCard}>
+          <View style={[styles.turnCard, { height: scoreCardHeight }]}>
             <Text style={styles.turnTitle}>Sıra</Text>
             <Text style={styles.turnPlayer}>
               {state.winner ? playerTheme[state.winner].label : playerTheme[state.turn].label}
@@ -1064,10 +1186,11 @@ export default function App() {
             capturedStoneColor={playerTheme.gold.piece}
             capturedStoneAccent={playerTheme.gold.accent}
             trayPulse={trayPulse.indigo}
+            cardHeight={scoreCardHeight}
           />
         </View>
 
-        <View style={styles.boardShell}>
+        <View style={[styles.boardShell, { paddingVertical: isCompactLayout ? 4 : 10 }]}>
           <View style={styles.boardShadow} />
           <View style={[styles.boardFrame, { width: boardSize }]}>
             {state.board.map((boardRow, rowIndex) => (
@@ -1157,9 +1280,9 @@ export default function App() {
           </View>
         </View>
 
-        <View style={styles.footerCard}>
+        <View style={[styles.footerCard, { minHeight: footerMinHeight }]}>
           <Text style={styles.footerTitle}>Durum</Text>
-          <Text style={styles.footerText}>{statusText}</Text>
+          <Text style={[styles.footerText, { minHeight: footerTextMinHeight }]}>{statusText}</Text>
           <View style={styles.footerActions}>
             <Pressable onPress={restartCurrentMode} style={styles.primaryButton}>
               <Text style={styles.primaryButtonText}>
@@ -1280,6 +1403,7 @@ function ScoreCard({
   capturedStoneColor,
   capturedStoneAccent,
   trayPulse,
+  cardHeight,
 }: {
   player: Player;
   state: GameState;
@@ -1300,9 +1424,10 @@ function ScoreCard({
   capturedStoneColor: string;
   capturedStoneAccent: string;
   trayPulse: Animated.Value;
+  cardHeight: number;
 }) {
   return (
-    <View style={[styles.scoreCard, { borderColor: meta[player].accent }]}>
+    <View style={[styles.scoreCard, { borderColor: meta[player].accent, height: cardHeight }]}>
       <Text style={styles.scorePlayer}>{meta[player].label}</Text>
       <Text style={styles.scoreValue}>
         {state.captured[player]} / {CAPTURE_GOAL}
@@ -1556,6 +1681,9 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     fontSize: 12,
   },
+  disabledButton: {
+    opacity: 0.58,
+  },
   statusCard: {
     borderRadius: 18,
     borderWidth: 1,
@@ -1693,11 +1821,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
     alignItems: 'stretch',
-    minHeight: 132,
   },
   scoreCard: {
     flex: 1,
-    height: 132,
     borderRadius: 18,
     borderWidth: 1.2,
     backgroundColor: '#ffffff',
@@ -1727,7 +1853,6 @@ const styles = StyleSheet.create({
   },
   turnCard: {
     flex: 1.2,
-    height: 132,
     borderRadius: 20,
     backgroundColor: '#fff7c8',
     borderWidth: 1.2,
@@ -1752,7 +1877,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 8,
     lineHeight: 17,
-    minHeight: 34,
   },
   boardShell: {
     alignItems: 'center',
@@ -1889,7 +2013,6 @@ const styles = StyleSheet.create({
     opacity: 0.28,
   },
   footerCard: {
-    minHeight: 146,
     borderRadius: 20,
     borderWidth: 1,
     borderColor: '#9bc7ff',
@@ -1907,7 +2030,6 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontSize: 14,
     lineHeight: 21,
-    minHeight: 44,
   },
   footerActions: {
     flexDirection: 'row',
