@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: cenan6238-kure-oyunu
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20

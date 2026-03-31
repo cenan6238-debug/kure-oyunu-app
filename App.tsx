@@ -55,7 +55,7 @@ type OpenRoom = {
   createdAt: number;
 };
 
-const DEFAULT_SERVER_URL = 'http://192.168.1.101:4000';
+const DEFAULT_SERVER_URL = 'https://cenan6238-kure-oyunu.onrender.com';
 
 const PLAYER_META: Record<
   Player,

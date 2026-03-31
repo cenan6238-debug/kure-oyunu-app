@@ -1,21 +1,26 @@
 # Ucretsiz Online Server Kurulumu (Render)
 
-## 1) Kodu GitHub'a gonder
-- Bu proje klasorunu bir GitHub reposuna push et.
+Bu proje `render.yaml` ile hazirlandi. Tek yapman gereken Render'da blueprint deploy etmek.
 
-## 2) Render'da Web Service ac
-- Render hesabina gir.
-- `New` -> `Web Service`.
-- Repo sec.
-- `Root Directory` olarak `server` sec.
-- `Build Command`: `npm install`
-- `Start Command`: `npm start`
-- Plan: `Free`
+## 1) Render'a gir
+- https://dashboard.render.com
 
-## 3) Acilan URL'yi oyuna yaz
-- Render bir URL verecek: `https://xxxxx.onrender.com`
-- Oyunda `Server URL` alanina bu adresi gir.
-- Artik ayni Wi-Fi zorunlu degil, internetten oda kurup katilabilirsiniz.
+## 2) Blueprint ile tek tik deploy
+- `New` -> `Blueprint`
+- GitHub reposu olarak `kure-oyunu-app` sec
+- Render, root'taki `render.yaml` dosyasini otomatik okuyacak
+- `Apply` diyip deploy et
+
+## 3) URL kontrolu
+- Servis adi `cenan6238-kure-oyunu`
+- Beklenen URL: `https://cenan6238-kure-oyunu.onrender.com`
+- Test: `https://cenan6238-kure-oyunu.onrender.com/health`
+
+## 4) Uygulama baglantisi
+- Mobil uygulamadaki varsayilan sunucu zaten bu URL'ye ayarli:
+  - `https://cenan6238-kure-oyunu.onrender.com`
+- Yani deploy tamamlaninca uygulama yeniden derlenip kuruldugunda herkes internetten oynayabilir.
 
 ## Not
-- Free planda server uykuya gecebilir; ilk baglanti 20-60 sn gecikebilir.
+- Free planda server uykuya gecebilir.
+- Ilk baglanti 20-60 sn surebilir.
