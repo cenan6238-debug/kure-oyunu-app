@@ -1,0 +1,36 @@
+name: Render Keepalive
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Render health endpoint
+        env:
+          RENDER_HEALTH_URL: ${{ vars.RENDER_HEALTH_URL }}
+          FALLBACK_HEALTH_URL: https://cenan6238-kure-oyunu.onrender.com/health
+        run: |
+          URL="$RENDER_HEALTH_URL"
+          if [ -z "$URL" ]; then
+            URL="$FALLBACK_HEALTH_URL"
+          fi
+
+          echo "Pinging $URL"
+
+          for i in 1 2 3; do
+            code="$(curl -sS -o /tmp/render-health.json -w '%{http_code}' --max-time 25 "$URL" || true)"
+            echo "Attempt $i => HTTP $code"
+            if [ "$code" = "200" ]; then
+              cat /tmp/render-health.json || true
+              exit 0
+            fi
+            sleep 8
+          done
+
+          echo "Render health ping failed."
+          exit 1

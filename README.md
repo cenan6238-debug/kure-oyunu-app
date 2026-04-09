@@ -5,3 +5,6 @@ Online server deploy adimlari:
 
 Render Free canli sunucu:
 - `https://cenan6238-kure-oyunu.onrender.com`
+
+Render keep-alive workflow:
+- `/.github/workflows/render-keepalive.yml`

@@ -5,6 +5,7 @@ Bu proje Render Free icin optimize edildi:
 - Frankfurt bolgesi
 - Bos/atıl odalari otomatik temizleme
 - Uygulamada otomatik sunucu uyandirma akisi
+- GitHub Actions ile periyodik keep-alive ping
 
 ## 1) Render'a gir
 - https://dashboard.render.com
@@ -35,3 +36,10 @@ Bu proje Render Free icin optimize edildi:
 - Sunucu bos kalinca uykuya gecer.
 - Ilk baglanti 20-60 sn surebilir.
 - Uygulamada `Oda Olustur / Hizli Esles` tiklayinca sunucu otomatik uyandirilir.
+
+## 7) Keep-alive (ucretsiz hizlandirma)
+- Repo icinde workflow hazir: `.github/workflows/render-keepalive.yml`
+- Varsayilan olarak her 10 dakikada bir `https://cenan6238-kure-oyunu.onrender.com/health` ping atar.
+- Istersen GitHub -> `Settings` -> `Secrets and variables` -> `Actions` -> `Variables` altina:
+  - `RENDER_HEALTH_URL=https://senin-servisin.onrender.com/health`
+- Sonra `Actions` sekmesinde workflow'u bir kez `Run workflow` ile baslat.

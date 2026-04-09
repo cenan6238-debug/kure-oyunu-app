@@ -1,5 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import { Audio } from 'expo-av';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
@@ -56,6 +57,10 @@ type OpenRoom = {
 };
 
 const DEFAULT_SERVER_URL = 'https://cenan6238-kure-oyunu.onrender.com';
+const NICKNAME_STORAGE_KEY = 'kure_oyunu_online_nickname';
+const BOARD_FRAME_PADDING = 8;
+const BOARD_FRAME_BORDER_WIDTH = 1.3;
+const SERVER_PREWARM_COOLDOWN_MS = 70_000;
 
 const PLAYER_META: Record<
   Player,
@@ -141,6 +146,11 @@ const PALETTE_OPTIONS: Array<{
   },
 ];
 
+const ONLINE_PALETTE_BY_PLAYER: Record<Player, PaletteId> = {
+  gold: 'yellow',
+  indigo: 'blue',
+};
+
 function pickRandom<T>(items: T[]): T {
   return items[Math.floor(Math.random() * items.length)];
 }
@@ -153,21 +163,35 @@ function buildCaptureSegments(
   flash: CaptureFlash,
   cellSize: number,
   boardInset: number,
+  flipBoard: boolean,
 ): CaptureSegment[] {
   if (!flash || !flash.captures.length) {
     return [];
   }
 
+  const toViewCoord = (coord: Coord) => {
+    if (!flipBoard) {
+      return coord;
+    }
+
+    return {
+      row: BOARD_SIZE - 1 - coord.row,
+      col: BOARD_SIZE - 1 - coord.col,
+    };
+  };
+
   return flash.captures.map((captured) => {
-    const rowDelta = captured.row - flash.move.to.row;
-    const colDelta = captured.col - flash.move.to.col;
+    const moveToView = toViewCoord(flash.move.to);
+    const capturedView = toViewCoord(captured);
+    const rowDelta = capturedView.row - moveToView.row;
+    const colDelta = capturedView.col - moveToView.col;
     const far = {
-      row: flash.move.to.row + rowDelta * 2,
-      col: flash.move.to.col + colDelta * 2,
+      row: moveToView.row + rowDelta * 2,
+      col: moveToView.col + colDelta * 2,
     };
 
-    const startX = boardInset + flash.move.to.col * cellSize + cellSize / 2;
-    const startY = boardInset + flash.move.to.row * cellSize + cellSize / 2;
+    const startX = boardInset + moveToView.col * cellSize + cellSize / 2;
+    const startY = boardInset + moveToView.row * cellSize + cellSize / 2;
     const endX = boardInset + far.col * cellSize + cellSize / 2;
     const endY = boardInset + far.row * cellSize + cellSize / 2;
     const distance = Math.hypot(endX - startX, endY - startY);
@@ -200,6 +224,7 @@ export default function App() {
   });
 
   const [nickname, setNickname] = useState('Oyuncu');
+  const [nicknameHydrated, setNicknameHydrated] = useState(false);
   const [roomCode, setRoomCode] = useState('');
   const [myColor, setMyColor] = useState<Player | null>(null);
   const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayers>({
@@ -234,35 +259,52 @@ export default function App() {
   const moveSoundRef = useRef<Audio.Sound | null>(null);
   const captureSoundRef = useRef<Audio.Sound | null>(null);
   const winSoundRef = useRef<Audio.Sound | null>(null);
+  const warmupInFlightRef = useRef<Promise<boolean> | null>(null);
+  const lastWarmupAtRef = useRef(0);
 
   const isCompactLayout = height < 760;
   const layoutGap = isCompactLayout ? 8 : 12;
-  const scoreCardHeight = isCompactLayout ? 110 : height < 860 ? 122 : 132;
+  const scoreCardHeight = isCompactLayout ? 116 : height < 860 ? 128 : 138;
   const footerMinHeight = isCompactLayout ? 126 : 146;
   const footerTextMinHeight = isCompactLayout ? 34 : 44;
-  const boardMaxByHeight = Math.max(250, height - (mode === 'online' ? 430 : 380));
-  const boardSize = Math.min(width - 26, 430, boardMaxByHeight);
-  const cellSize = boardSize / BOARD_SIZE;
-  const boardInset = 8;
+  const boardMaxByHeight = Math.max(250, height - (mode === 'online' ? 448 : 390));
+  const boardSize = Math.floor(Math.min(width - 26, 430, boardMaxByHeight));
+  const boardInset = BOARD_FRAME_PADDING;
+  const cellSize =
+    (boardSize - boardInset * 2 - BOARD_FRAME_BORDER_WIDTH * 2) / BOARD_SIZE;
+  const effectivePaletteByPlayer =
+    mode === 'online' ? ONLINE_PALETTE_BY_PLAYER : paletteByPlayer;
+  // Board starts with gold at the bottom and indigo at the top.
+  // Flip only for indigo so both players see their own stones from the bottom.
+  const shouldFlipBoard = mode === 'online' && myColor === 'indigo';
   const playerTheme = useMemo(
     () => ({
       gold: {
         ...PLAYER_META.gold,
-        ...getPaletteById(paletteByPlayer.gold),
-        label: getPaletteById(paletteByPlayer.gold).name,
+        ...getPaletteById(effectivePaletteByPlayer.gold),
+        label: getPaletteById(effectivePaletteByPlayer.gold).name,
       },
       indigo: {
         ...PLAYER_META.indigo,
-        ...getPaletteById(paletteByPlayer.indigo),
-        label: getPaletteById(paletteByPlayer.indigo).name,
+        ...getPaletteById(effectivePaletteByPlayer.indigo),
+        label: getPaletteById(effectivePaletteByPlayer.indigo).name,
       },
     }),
-    [paletteByPlayer],
+    [effectivePaletteByPlayer],
   );
   const captureSegments = useMemo(
-    () => buildCaptureSegments(captureFlash, cellSize, boardInset),
-    [boardInset, captureFlash, cellSize],
+    () => buildCaptureSegments(captureFlash, cellSize, boardInset, shouldFlipBoard),
+    [boardInset, captureFlash, cellSize, shouldFlipBoard],
   );
+  const opponentColor: Player | null = myColor
+    ? myColor === 'gold'
+      ? 'indigo'
+      : 'gold'
+    : null;
+  const myDisplayName = myColor ? onlinePlayers[myColor] || nickname : nickname;
+  const opponentDisplayName = opponentColor
+    ? onlinePlayers[opponentColor] || 'Rakip bekleniyor'
+    : 'Rakip bekleniyor';
 
   const isOnlineTurn =
     mode === 'online' &&
@@ -300,6 +342,41 @@ export default function App() {
 
     return () => clearTimeout(timer);
   }, [cpuDifficulty, isComputerTurn, state]);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    AsyncStorage.getItem(NICKNAME_STORAGE_KEY)
+      .then((saved) => {
+        if (!isMounted) {
+          return;
+        }
+
+        const normalized = String(saved || '').trim();
+        if (normalized) {
+          setNickname(normalized.slice(0, 20));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (isMounted) {
+          setNicknameHydrated(true);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!nicknameHydrated) {
+      return;
+    }
+
+    const normalized = String(nickname || '').trim() || 'Oyuncu';
+    AsyncStorage.setItem(NICKNAME_STORAGE_KEY, normalized.slice(0, 20)).catch(() => {});
+  }, [nickname, nicknameHydrated]);
 
   useEffect(() => {
     let isActive = true;
@@ -453,8 +530,16 @@ export default function App() {
     if (screen !== 'online') {
       return;
     }
-    refreshOpenRooms(false);
+    refreshOpenRooms(true);
   }, [screen]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      warmServer(false).catch(() => {});
+    }, 700);
+
+    return () => clearTimeout(timer);
+  }, []);
 
   function delay(ms: number) {
     return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -472,33 +557,57 @@ export default function App() {
   }
 
   async function warmServer(showStatus = true): Promise<boolean> {
+    const now = Date.now();
+    if (now - lastWarmupAtRef.current < SERVER_PREWARM_COOLDOWN_MS) {
+      return true;
+    }
+
+    if (warmupInFlightRef.current) {
+      if (showStatus) {
+        setStatusText('Sunucu hazırlanıyor, lütfen bekle...');
+      }
+      return warmupInFlightRef.current;
+    }
+
     const healthUrl = `${DEFAULT_SERVER_URL}/health`;
     const attempts = [25000, 18000, 12000];
 
-    for (let index = 0; index < attempts.length; index += 1) {
-      if (showStatus) {
-        setStatusText(
-          index === 0
-            ? 'Sunucu uyandırılıyor, lütfen bekle...'
-            : `Sunucu hazırlanıyor... (${index + 1}/${attempts.length})`,
-        );
-      }
-
-      try {
-        const response = await fetchWithTimeout(healthUrl, attempts[index]);
-        if (response.ok) {
-          return true;
+    const warmPromise = (async () => {
+      for (let index = 0; index < attempts.length; index += 1) {
+        if (showStatus) {
+          setStatusText(
+            index === 0
+              ? 'Sunucu uyandırılıyor, lütfen bekle...'
+              : `Sunucu hazırlanıyor... (${index + 1}/${attempts.length})`,
+          );
         }
-      } catch {
-        // Render free planda ilk denemelerde timeout normal.
+
+        try {
+          const response = await fetchWithTimeout(healthUrl, attempts[index]);
+          if (response.ok) {
+            lastWarmupAtRef.current = Date.now();
+            return true;
+          }
+        } catch {
+          // Render free planda ilk denemelerde timeout normal.
+        }
+
+        if (index < attempts.length - 1) {
+          await delay(1400);
+        }
       }
 
-      if (index < attempts.length - 1) {
-        await delay(1400);
+      return false;
+    })();
+
+    warmupInFlightRef.current = warmPromise;
+    try {
+      return await warmPromise;
+    } finally {
+      if (warmupInFlightRef.current === warmPromise) {
+        warmupInFlightRef.current = null;
       }
     }
-
-    return false;
   }
 
   function connectSocket(initialAction?: (socket: Socket) => void) {
@@ -1135,7 +1244,7 @@ export default function App() {
           },
         ]}
       >
-        <View style={styles.gameTopBar}>
+        <View style={[styles.gameTopBar, mode === 'online' && { marginTop: 36 }]}>
           <Pressable onPress={mode === 'online' ? leaveOnlineMatch : () => setScreen('home')} style={styles.iconButton}>
             <Text style={styles.iconButtonText}>{mode === 'online' ? 'Odadan Çık' : 'Ana Menü'}</Text>
           </Pressable>
@@ -1150,11 +1259,10 @@ export default function App() {
         {mode === 'online' ? (
           <View style={styles.onlineMetaCard}>
             <Text style={styles.onlineMetaLine}>
-              Sen: {myColor ? playerTheme[myColor].label : '-'} ({nickname})
+              {myDisplayName} ({myColor ? playerTheme[myColor].label : '-'})
             </Text>
             <Text style={styles.onlineMetaLine}>
-              {playerTheme.gold.label}: {onlinePlayers.gold || '-'} | {playerTheme.indigo.label}:{' '}
-              {onlinePlayers.indigo || '-'}
+              {opponentDisplayName} ({opponentColor ? playerTheme[opponentColor].label : '-'})
             </Text>
           </View>
         ) : null}
@@ -1193,17 +1301,19 @@ export default function App() {
         <View style={[styles.boardShell, { paddingVertical: isCompactLayout ? 4 : 10 }]}>
           <View style={styles.boardShadow} />
           <View style={[styles.boardFrame, { width: boardSize }]}>
-            {state.board.map((boardRow, rowIndex) => (
-              <View key={`row-${rowIndex}`} style={styles.boardRow}>
-                {boardRow.map((cell, colIndex) => {
-                  const isSelected =
-                    selected?.row === rowIndex && selected?.col === colIndex;
+            {Array.from({ length: BOARD_SIZE }, (_, viewRowIndex) => (
+              <View key={`row-${viewRowIndex}`} style={styles.boardRow}>
+                {Array.from({ length: BOARD_SIZE }, (_, viewColIndex) => {
+                  const rowIndex = shouldFlipBoard
+                    ? BOARD_SIZE - 1 - viewRowIndex
+                    : viewRowIndex;
+                  const colIndex = shouldFlipBoard
+                    ? BOARD_SIZE - 1 - viewColIndex
+                    : viewColIndex;
+                  const cell = state.board[rowIndex][colIndex];
                   const isTarget = validTargets.some(
                     (move) => move.row === rowIndex && move.col === colIndex,
                   );
-                  const isLastMove =
-                    state.lastMove?.to.row === rowIndex &&
-                    state.lastMove?.to.col === colIndex;
                   const tileColor = (rowIndex + colIndex) % 2 === 0 ? '#141418' : '#202028';
 
                   return (
@@ -1217,8 +1327,6 @@ export default function App() {
                           height: cellSize,
                           backgroundColor: tileColor,
                         },
-                        isSelected && styles.selectedCell,
-                        isLastMove && styles.lastMoveCell,
                       ]}
                     >
                       <View style={styles.cellRailHorizontal} />
@@ -1286,7 +1394,7 @@ export default function App() {
           <View style={styles.footerActions}>
             <Pressable onPress={restartCurrentMode} style={styles.primaryButton}>
               <Text style={styles.primaryButtonText}>
-                {mode === 'online' ? 'Rematch İsteği' : 'Yeni Tur'}
+                {mode === 'online' ? 'Rövanş İste' : 'Yeni Tur'}
               </Text>
             </Pressable>
             {mode === 'cpu' ? (
@@ -1766,14 +1874,17 @@ const styles = StyleSheet.create({
   gameLayout: {
     flex: 1,
     paddingHorizontal: 14,
+    paddingTop: 16,
     paddingBottom: 16,
     gap: 12,
   },
   gameTopBar: {
-    marginTop: 8,
+    marginTop: 20,
+    marginBottom: 4,
+    marginHorizontal: 8,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
   iconButton: {
     borderRadius: 14,
@@ -1809,13 +1920,14 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#9ec9ff',
     backgroundColor: '#ffffff',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    gap: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    gap: 6,
   },
   onlineMetaLine: {
     color: '#3d5797',
-    fontSize: 12,
+    fontSize: 16,
+    fontWeight: '700',
   },
   scoreRow: {
     flexDirection: 'row',
@@ -1828,7 +1940,9 @@ const styles = StyleSheet.create({
     borderWidth: 1.2,
     backgroundColor: '#ffffff',
     paddingHorizontal: 10,
-    paddingVertical: 12,
+    paddingTop: 12,
+    paddingBottom: 12,
+    overflow: 'hidden',
   },
   scorePlayer: {
     color: '#29428b',
@@ -1849,7 +1963,7 @@ const styles = StyleSheet.create({
   seriesScore: {
     color: '#4d66a5',
     fontSize: 11,
-    marginTop: 6,
+    marginTop: 4,
   },
   turnCard: {
     flex: 1.2,
@@ -1894,8 +2008,8 @@ const styles = StyleSheet.create({
   },
   boardFrame: {
     borderRadius: 24,
-    padding: 8,
-    borderWidth: 1.3,
+    padding: BOARD_FRAME_PADDING,
+    borderWidth: BOARD_FRAME_BORDER_WIDTH,
     borderColor: '#383842',
     backgroundColor: '#0c0c10',
     overflow: 'hidden',
@@ -1945,13 +2059,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.24)',
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
-  },
-  selectedCell: {
-    backgroundColor: '#30303a',
-  },
-  lastMoveCell: {
-    borderWidth: 1.8,
-    borderColor: '#ffdf5c',
   },
   captureOverlayLayer: {
     position: 'absolute',
@@ -2013,6 +2120,7 @@ const styles = StyleSheet.create({
     opacity: 0.28,
   },
   footerCard: {
+    marginHorizontal: 8,
     borderRadius: 20,
     borderWidth: 1,
     borderColor: '#9bc7ff',
@@ -2181,16 +2289,19 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   capturedTray: {
+    marginTop: 6,
     flexDirection: 'row',
     flexWrap: 'nowrap',
     gap: 4,
-    marginTop: 8,
-    height: 18,
+    height: 16,
     alignItems: 'center',
+    borderRadius: 999,
+    backgroundColor: '#f3f8ff',
+    paddingHorizontal: 4,
   },
   capturedStone: {
-    width: 14,
-    height: 14,
+    width: 12,
+    height: 12,
     borderRadius: 999,
     borderWidth: 1.5,
   },
